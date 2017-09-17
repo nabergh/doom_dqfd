@@ -1,3 +1,4 @@
+import random
 from collections import namedtuple
 
 import torch
@@ -25,18 +26,19 @@ class PreprocessImage(ObservationWrapper):
         return screen
 
 
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'n_reward'))
 class ReplayMemory(object):
+
     # capacity == -1 means unlimited capacity
     def __init__(self, capacity=-1):
         self.capacity = capacity
         self.memory = []
         self.position = 0
 
-    def push(self, *args):
+    def push(self, trans):
         if len(self.memory) < self.capacity or self.capacity < 0:
             self.memory.append(None)
-        self.memory[self.position] = Transition(*args)
+        self.memory[self.position] = trans
         self.position = self.position + 1
         if self.capacity > 0:
             self.position = self.position % self.capacity
@@ -46,3 +48,19 @@ class ReplayMemory(object):
 
     def __len__(self):
         return len(self.memory)
+
+class EpsGreedyPolicy(object):
+    def __init__(self, eps_start, eps_end, eps_steps):
+        self.eps_start = eps_start
+        self.eps_end = eps_end
+        self.eps_steps = eps_steps
+        self.steps_done = -1
+
+    def select_action(self, q_vals, env):
+        sample = random.random()
+        self.steps_done += 1
+        if sample > self.steps_done / self.eps_steps * (self.eps_start - self.eps_end):
+            return q_vals.max(1)[1].cpu()
+        else:
+            return torch.LongTensor([env.action_space.sample()])
+

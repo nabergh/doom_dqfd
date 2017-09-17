@@ -1,7 +1,4 @@
-import numpy as np
 from itertools import count
-import random
-import math
 import time
 from datetime import date
 import pickle
@@ -21,13 +18,12 @@ from torch.autograd import Variable
 
 from tensorboard_logger import configure, log_value
 
-from utils import ReplayMemory, PreprocessImage
+from utils import ReplayMemory, PreprocessImage, EpsGreedyPolicy, Transition
 
 # Hyperparameters
 GAMMA = 0.99
-EPS_START = 1.00
-EPS_END = 0.00
-EPS_STEPS = 6000
+DEMO_RATIO = 0.3
+L2_PENALTY = 10e-5
 
 # GPU support
 USE_CUDA = torch.cuda.is_available()
@@ -75,19 +71,10 @@ class DQN(nn.Module):
         x = F.leaky_relu(self.lin2(x))
         return self.lin3(x)
 
-    def select_action(self, state, env):
-        # eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1. * self.steps_done / EPS_DECAY)
-        sample = random.random()
-        self.steps_done += 1
-        if sample > self.epsilons[min(self.steps_done, EPS_STEPS - 1)] or args.no_train:
-            return self(Variable(state.type(self.dtype), volatile=True)).data.max(1)[1].cpu()
-        else:
-            return torch.LongTensor([env.action_space.sample()])
-
-def optimize_model(bsz):
-    if len(memory) < bsz:
+def pretrain_model(bsz):
+    if len(demos) < bsz:
         return
-    transitions = memory.sample(bsz)
+    transitions = demos.sample(bsz)
     batch = Transition(*zip(*transitions))
 
     non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
@@ -111,8 +98,48 @@ def optimize_model(bsz):
     optimizer.zero_grad()
     loss.backward()
     log_value('Average loss', loss.mean().data[0], model.steps_done)
-    # for param in model.parameters():
-    #     param.grad.data.clamp_(-1, 1)
+
+    optimizer.step()
+
+
+def optimize_model(bsz):
+    demo_samples = int(bsz * DEMO_RATIO)
+    demo_trans = demos.sample(demo_samples)
+    agent_trans = memory.sample(bsz - demo_samples)
+    transitions = demo_trans + agent_trans
+    batch = Transition(*zip(*transitions))
+
+    non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
+    non_final_next_states_t = torch.cat(tuple(s for s in batch.next_state if s is not None)).type(dtype)
+    non_final_next_states = Variable(non_final_next_states_t, volatile=True)
+    state_batch = Variable(torch.cat(batch.state))
+    action_batch = Variable(torch.cat(batch.action).unsqueeze(1))
+    reward_batch = Variable(torch.cat(batch.reward))
+    if USE_CUDA:
+        state_batch = state_batch.cuda()
+        action_batch = action_batch.cuda()
+        reward_batch = reward_batch.cuda()
+        non_final_mask = non_final_mask.cuda()
+    q_vals = model(state_batch)
+    state_action_values = q_vals.gather(1, action_batch)
+
+    next_state_values = Variable(torch.zeros(bsz).cuda())
+    next_state_values[non_final_mask] = model(non_final_next_states).data.max(1)[0]
+    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+
+
+    n_actions = action_batch.size(1)
+    margins = torch.ones(n_actions, n_actions) * MARGIN - torch.eye(n_actions) * MARGIN
+    batch_margins = margins.gather(1, action_batch)
+
+    supervised_loss = (q_vals.max(1)[0] + batch_margins - state_action_values)[:demo_samples].sum()
+    q_loss = F.l1_loss(state_action_values, expected_state_action_values)
+    n_step_loss = F1.l1_loss(state_action_values, batch.n_reward)
+    
+    optimizer.zero_grad()
+    loss.backward()
+    log_value('Average loss', loss.mean().data[0], model.steps_done)
+
     optimizer.step()
 
 
@@ -137,11 +164,18 @@ parser.add_argument('--load-name', default=None, metavar='SN',
                     help='path/prefix for the filename to load model\'s parameters')
 parser.add_argument('--monitor', action="store_true",
                     help='whether to monitor results')
+parser.add_argument('--eps-start', type=int, default=1.0, metavar='EST',
+                    help='starting value for epsilon')
+parser.add_argument('--eps-end', type=int, default=0.0, metavar='EEND',
+                    help='ending value for epsilon')
+parser.add_argument('--eps-steps', type=int, default=6000, metavar='ES',
+                    help='number of episodes before epsilon equals eps-end (linearly degrades)')
 parser.add_argument('--no-train', action="store_true",
                     help='set to true if you don\'t want to actually train')
 
 if __name__ == '__main__':
     args = parser.parse_args()
+
     
     timestring = str(date.today()) + '_' + time.strftime("%Hh-%Mm-%Ss", time.localtime(time.time()))
     save_name = args.save_name + '_' + timestring
@@ -161,25 +195,48 @@ if __name__ == '__main__':
     if args.load_name is not None:
         model.load_state_dict(pickle.load(open(args.load_name + '.p', 'rb')))
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    if args.no_train:
+        args.eps_start = 0.0
+        args.eps_end = 0.0
 
-    model.epsilons = np.linspace(EPS_START, EPS_END, EPS_STEPS)
+    policy = EpsGreedyPolicy(args.eps_start, args.eps_end, args.eps_steps)
+
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=L2_PENALTY)
 
     ep_counter = count(1) if args.num_eps < 0 else range(args.num_eps)
     for i_episode in ep_counter:
         state = env.reset()
         total_reward = 0
+        transitions = []
+        q_vals = model(Variable(state.type(dtype), volatile=True)).data
         for step_n in count():
-            action = model.select_action(state, env)
+            action = policy.select_action(q_vals, env)
             next_state, reward, done, _ = env.step(action[0])
-            reward = torch.Tensor([reward])
+            reward = torch.Tensor([reward]).type(dtype)
 
             if done:
                 next_state = None
 
-            memory.push(state, action, next_state, reward)
+            # calculating n-step return
+            transitions.insert(0, Transition(state, action, next_state, reward, torch.zeros(1).type(dtype)))
+            gamma = 1
+            for trans in transitions:
+                trans = trans._replace(n_reward= trans.n_reward + gamma * reward)
+                gamma = gamma * GAMMA
 
-            state = next_state
+            if not done:
+                q_vals = model(Variable(next_state.type(dtype), volatile=True)).data
+
+                if len(transitions) >= 10:
+                    last_trans = transitions.pop()
+                    last_trans = last_trans._replace(n_reward=last_trans.n_reward + gamma * q_vals.max(1)[0])
+                    memory.push(last_trans)
+
+                state = next_state
+            
+            else:
+                for trans in transitions:
+                    memory.push(trans)
 
             if len(memory) >= args.init_states and not args.no_train:
                 optimize_model(bsz)
