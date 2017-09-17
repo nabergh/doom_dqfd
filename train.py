@@ -24,6 +24,7 @@ from utils import ReplayMemory, PreprocessImage, EpsGreedyPolicy, Transition
 GAMMA = 0.99
 DEMO_RATIO = 0.3
 L2_PENALTY = 10e-5
+MARGIN = 10.0
 
 # GPU support
 USE_CUDA = torch.cuda.is_available()
@@ -46,7 +47,6 @@ class DQN(nn.Module):
         self.lin3 = nn.Linear(256, num_actions)
 
         self.type(dtype)
-        self.steps_done = -1
 
     def _get_conv_output(self, shape):
         input = Variable(torch.rand(1, *shape))
@@ -71,39 +71,12 @@ class DQN(nn.Module):
         x = F.leaky_relu(self.lin2(x))
         return self.lin3(x)
 
-def pretrain_model(bsz):
-    if len(demos) < bsz:
-        return
-    transitions = demos.sample(bsz)
-    batch = Transition(*zip(*transitions))
+def load_demos(fname):
+    with open(fname, 'rb') as demo_file:
+        return pickle.load(demo_file)
 
-    non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
-    non_final_next_states_t = torch.cat(tuple(s for s in batch.next_state if s is not None)).type(dtype)
-    non_final_next_states = Variable(non_final_next_states_t, volatile=True)
-    state_batch = Variable(torch.cat(batch.state))
-    action_batch = Variable(torch.cat(batch.action).unsqueeze(1))
-    reward_batch = Variable(torch.cat(batch.reward))
-    if USE_CUDA:
-        state_batch = state_batch.cuda()
-        action_batch = action_batch.cuda()
-        reward_batch = reward_batch.cuda()
-        non_final_mask = non_final_mask.cuda()
-    state_action_values = model(state_batch).gather(1, action_batch)
-
-    next_state_values = Variable(torch.zeros(bsz).cuda())
-    next_state_values[non_final_mask] = model(non_final_next_states).data.max(1)[0]
-    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-
-    loss = F.mse_loss(state_action_values, expected_state_action_values)
-    optimizer.zero_grad()
-    loss.backward()
-    log_value('Average loss', loss.mean().data[0], model.steps_done)
-
-    optimizer.step()
-
-
-def optimize_model(bsz):
-    demo_samples = int(bsz * DEMO_RATIO)
+def optimize_model(bsz, demo_ratio, opt_step):
+    demo_samples = int(bsz * demo_ratio)
     demo_trans = demos.sample(demo_samples)
     agent_trans = memory.sample(bsz - demo_samples)
     transitions = demo_trans + agent_trans
@@ -127,21 +100,21 @@ def optimize_model(bsz):
     next_state_values[non_final_mask] = model(non_final_next_states).data.max(1)[0]
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
+    max_qs = q_vals.max(1)
+    batch_margins = (Variable(torch.ones(action_batch.size(0), 1)).type(dtype) 
+        - action_batch.eq(max_qs[1].unsqueeze(1)).type(dtype)) * MARGIN
 
-    n_actions = action_batch.size(1)
-    margins = torch.ones(n_actions, n_actions) * MARGIN - torch.eye(n_actions) * MARGIN
-    batch_margins = margins.gather(1, action_batch)
+    supervised_loss = (max_qs[0].unsqueeze(1) + batch_margins - state_action_values).pow(2)[:demo_samples].sum()
+    q_loss = F.mse_loss(state_action_values, expected_state_action_values, size_average=False)
 
-    supervised_loss = (q_vals.max(1)[0] + batch_margins - state_action_values)[:demo_samples].sum()
-    q_loss = F.l1_loss(state_action_values, expected_state_action_values)
-    n_step_loss = F1.l1_loss(state_action_values, batch.n_reward)
-    
+    loss = q_loss + supervised_loss
     optimizer.zero_grad()
     loss.backward()
-    log_value('Average loss', loss.mean().data[0], model.steps_done)
-
     optimizer.step()
 
+    log_value('Average loss', loss.mean().data[0], opt_step)
+    log_value('Q loss', q_loss.mean().data[0], opt_step)
+    log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
 
 
 
@@ -172,6 +145,8 @@ parser.add_argument('--eps-steps', type=int, default=6000, metavar='ES',
                     help='number of episodes before epsilon equals eps-end (linearly degrades)')
 parser.add_argument('--no-train', action="store_true",
                     help='set to true if you don\'t want to actually train')
+parser.add_argument('--demo-file', metavar='DF',
+                    help='file to load pickled demonstrations')
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -191,6 +166,8 @@ if __name__ == '__main__':
     env.reset()
     memory = ReplayMemory(10000)
 
+    demos = load_demos(args.demo_file)
+
     model = DQN(dtype, (1, 80, 80), env.action_space.n)
     if args.load_name is not None:
         model.load_state_dict(pickle.load(open(args.load_name + '.p', 'rb')))
@@ -203,43 +180,31 @@ if __name__ == '__main__':
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=L2_PENALTY)
 
+    opt_step = 0
+    print('Pre-training')
+    for i in range(1000):
+        opt_step += 1
+        optimize_model(args.bsz, 1.0, opt_step)
+    print('Pre-training done')
+
     ep_counter = count(1) if args.num_eps < 0 else range(args.num_eps)
     for i_episode in ep_counter:
         state = env.reset()
         total_reward = 0
-        transitions = []
         q_vals = model(Variable(state.type(dtype), volatile=True)).data
         for step_n in count():
             action = policy.select_action(q_vals, env)
             next_state, reward, done, _ = env.step(action[0])
-            reward = torch.Tensor([reward]).type(dtype)
+            reward = torch.Tensor([reward])
 
             if done:
                 next_state = None
 
-            # calculating n-step return
-            transitions.insert(0, Transition(state, action, next_state, reward, torch.zeros(1).type(dtype)))
-            gamma = 1
-            for trans in transitions:
-                trans = trans._replace(n_reward= trans.n_reward + gamma * reward)
-                gamma = gamma * GAMMA
-
-            if not done:
-                q_vals = model(Variable(next_state.type(dtype), volatile=True)).data
-
-                if len(transitions) >= 10:
-                    last_trans = transitions.pop()
-                    last_trans = last_trans._replace(n_reward=last_trans.n_reward + gamma * q_vals.max(1)[0])
-                    memory.push(last_trans)
-
-                state = next_state
-            
-            else:
-                for trans in transitions:
-                    memory.push(trans)
+            memory.push(Transition(state, action, next_state, reward))
 
             if len(memory) >= args.init_states and not args.no_train:
-                optimize_model(bsz)
+                opt_step += 1
+                optimize_model(args.bsz, DEMO_RATIO, opt_step)
 
             total_reward += reward
             if done:

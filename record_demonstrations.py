@@ -1,10 +1,11 @@
 import sys, gym
 import ppaquette_gym_doom
-# from doom_utils import ToDiscrete
-from utils import ReplayMemory, PreprocessImage
+from doom_utils import ToDiscrete
+from utils import ReplayMemory, PreprocessImage, Transition
 from datetime import date
 import time
 import pickle
+import torch
 
 class TransitionSaver:
     def __init__(self):
@@ -16,16 +17,14 @@ class TransitionSaver:
 
     def add_transition(self, action, next_state, reward):
         next_state = self.processor._observation(next_state)
-        self.memory.push(self.state, self.add_noop(action), next_state, reward)
+        self.memory.push(Transition(self.state, self.add_noop(action), next_state, torch.FloatTensor([reward])))
         self.state = next_state
     
     def add_noop(self, actions):
-        new_actions = actions
-        new_actions.insert(1, 0)
-        for action in actions:
-            if action != 0:
-                new_actions[0] = 0
-                return new_actions
+        actions.insert(0, 0)
+        actions = torch.LongTensor(actions)
+        actions[0] = (1 - actions[1:].max(0)[0])[0]
+        return actions.max(0)[1]
 
     def save(self, fname):
         with open(fname, 'wb') as memory_file:
@@ -54,9 +53,9 @@ DOOM_ENV = 'DoomBasic-v0'
 
 for i in range(10):
     env = gym.make('ppaquette/' + DOOM_ENV)
-    # env = ToDiscrete("minimal")(env)
+    env = ToDiscrete("minimal")(env)
     env.unwrapped._mode = 'human'
     env.reset()
 
 timestring = str(date.today()) + '_' + time.strftime("%Hh-%Mm-%Ss", time.localtime(time.time()))
-saver.save('DoomBasic_demo_' + timestring)
+saver.save('demos/DoomBasic_demo_' + timestring + '.p')

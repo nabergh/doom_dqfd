@@ -3,3 +3,4 @@ models/
 monitor/
 __pycache__/
 vizdoom.ini
+demos/
