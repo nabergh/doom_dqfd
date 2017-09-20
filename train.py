@@ -100,11 +100,12 @@ def optimize_model(bsz, demo_ratio, opt_step):
     next_state_values[non_final_mask] = model(non_final_next_states).data.max(1)[0]
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
-    max_qs = q_vals.max(1)
-    batch_margins = (Variable(torch.ones(action_batch.size(0), 1)).type(dtype) 
-        - action_batch.eq(max_qs[1].unsqueeze(1)).type(dtype)) * MARGIN
+    num_actions = q_vals.size(1)
+    margins = (torch.ones(num_actions, num_actions) - torch.eye(num_actions)) * MARGIN
+    batch_margins = margins[action_batch.data.squeeze().cpu()]
+    q_vals = q_vals + Variable(batch_margins).type(dtype)
 
-    supervised_loss = (max_qs[0].unsqueeze(1) + batch_margins - state_action_values).pow(2)[:demo_samples].sum()
+    supervised_loss = (q_vals.max(1)[0].unsqueeze(1) - state_action_values).pow(2)[:demo_samples].sum()
     q_loss = F.mse_loss(state_action_values, expected_state_action_values, size_average=False)
 
     loss = q_loss + supervised_loss
@@ -117,8 +118,6 @@ def optimize_model(bsz, demo_ratio, opt_step):
     log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
 
 
-
-# env.close()
 
 parser = argparse.ArgumentParser(description='Doom DQN')
 parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
