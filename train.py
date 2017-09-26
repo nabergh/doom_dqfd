@@ -22,7 +22,7 @@ from utils import ReplayMemory, PreprocessImage, EpsGreedyPolicy, Transition
 
 # Hyperparameters
 GAMMA = 0.99
-DEMO_RATIO = 0.3
+DEMO_RATIO = 0.2
 L2_PENALTY = 10e-5
 MARGIN = 10.0
 
@@ -109,6 +109,7 @@ def optimize_model(bsz, demo_ratio, opt_step):
     q_loss = F.mse_loss(state_action_values, expected_state_action_values, size_average=False)
 
     loss = q_loss + supervised_loss
+    # loss = q_loss
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
@@ -177,6 +178,7 @@ if __name__ == '__main__':
 
     policy = EpsGreedyPolicy(args.eps_start, args.eps_end, args.eps_steps)
 
+    # optimizer = optim.Adam(model.parameters(), lr=args.lr)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=L2_PENALTY)
 
     opt_step = 0
@@ -190,8 +192,8 @@ if __name__ == '__main__':
     for i_episode in ep_counter:
         state = env.reset()
         total_reward = 0
-        q_vals = model(Variable(state.type(dtype), volatile=True)).data
         for step_n in count():
+            q_vals = model(Variable(state.type(dtype), volatile=True)).data
             action = policy.select_action(q_vals, env)
             next_state, reward, done, _ = env.step(action[0])
             reward = torch.Tensor([reward])
@@ -200,7 +202,8 @@ if __name__ == '__main__':
                 next_state = None
 
             memory.push(Transition(state, action, next_state, reward))
-
+            state = next_state
+            
             if len(memory) >= args.init_states and not args.no_train:
                 opt_step += 1
                 optimize_model(args.bsz, DEMO_RATIO, opt_step)

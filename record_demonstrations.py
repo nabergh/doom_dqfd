@@ -16,7 +16,8 @@ class TransitionSaver:
         self.state = self.processor._observation(first_state)
 
     def add_transition(self, action, next_state, reward):
-        next_state = self.processor._observation(next_state)
+        if next_state is not None:
+            next_state = self.processor._observation(next_state)
         self.memory.push(Transition(self.state, self.add_noop(action), next_state, torch.FloatTensor([reward])))
         self.state = next_state
     
@@ -36,10 +37,12 @@ def _play_human_mode(self):
     state = self.game.get_state().image_buffer.copy()
     saver.new_episode(state)
     while not self.game.is_episode_finished():
-        self.game.advance_action()
+        self.game.advance_action(4)
         img = self.game.get_state().image_buffer
         if img is not None:
             state = img.copy()
+        if self.game.is_episode_finished():
+            state = None
         action = self.game.get_last_action()
         reward = self.game.get_last_reward()
         saver.add_transition(action, state, reward)
