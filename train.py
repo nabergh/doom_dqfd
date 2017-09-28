@@ -3,6 +3,7 @@ import time
 from datetime import date
 import pickle
 import argparse
+import json
 
 import gym
 import ppaquette_gym_doom
@@ -22,7 +23,6 @@ from utils import ReplayMemory, PreprocessImage, EpsGreedyPolicy, Transition
 
 # Hyperparameters
 GAMMA = 0.99
-DEMO_RATIO = 0.2
 L2_PENALTY = 10e-5
 MARGIN = 10.0
 
@@ -75,9 +75,11 @@ def load_demos(fname):
     with open(fname, 'rb') as demo_file:
         return pickle.load(demo_file)
 
-def optimize_model(bsz, demo_ratio, opt_step):
-    demo_samples = int(bsz * demo_ratio)
-    demo_trans = demos.sample(demo_samples)
+def optimize_model(bsz, demo_prop, opt_step):
+    demo_samples = int(bsz * demo_prop)
+    demo_trans = []
+    if demo_samples > 0:
+        demo_trans = demos.sample(demo_samples)
     agent_trans = memory.sample(bsz - demo_samples)
     transitions = demo_trans + agent_trans
     batch = Transition(*zip(*transitions))
@@ -100,23 +102,28 @@ def optimize_model(bsz, demo_ratio, opt_step):
     next_state_values[non_final_mask] = model(non_final_next_states).data.max(1)[0]
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
-    num_actions = q_vals.size(1)
-    margins = (torch.ones(num_actions, num_actions) - torch.eye(num_actions)) * MARGIN
-    batch_margins = margins[action_batch.data.squeeze().cpu()]
-    q_vals = q_vals + Variable(batch_margins).type(dtype)
-
-    supervised_loss = (q_vals.max(1)[0].unsqueeze(1) - state_action_values).pow(2)[:demo_samples].sum()
     q_loss = F.mse_loss(state_action_values, expected_state_action_values, size_average=False)
 
-    loss = q_loss + supervised_loss
-    # loss = q_loss
+    if demo_prop > 0:
+        num_actions = q_vals.size(1)
+        margins = (torch.ones(num_actions, num_actions) - torch.eye(num_actions)) * MARGIN
+        batch_margins = margins[action_batch.data.squeeze().cpu()]
+        q_vals = q_vals + Variable(batch_margins).type(dtype)
+
+        supervised_loss = (q_vals.max(1)[0].unsqueeze(1) - state_action_values).pow(2)[:demo_samples].sum()
+        loss = q_loss + supervised_loss
+    else:
+        loss = q_loss
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
     log_value('Average loss', loss.mean().data[0], opt_step)
     log_value('Q loss', q_loss.mean().data[0], opt_step)
-    log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
+
+    if demo_prop > 0:
+        log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
 
 
 
@@ -127,6 +134,8 @@ parser.add_argument('--bsz', type=int, default=32, metavar='BSZ',
                     help='batch size (default: 32)')
 parser.add_argument('--num-eps', type=int, default=-1, metavar='NE',
                     help='number of episodes to train (default: train forever)')
+parser.add_argument('--frame-skip', type=int, default=4, metavar='FS',
+                    help='number of frames to skip between agent input (must match frame skip for demos)')
 parser.add_argument('--init-states', type=int, default=1000, metavar='IS',
                     help='number of states to store in memory before training (default: 1000)')
 parser.add_argument('--env-name', default='DoomBasic-v0', metavar='ENV',
@@ -143,21 +152,29 @@ parser.add_argument('--eps-end', type=int, default=0.0, metavar='EEND',
                     help='ending value for epsilon')
 parser.add_argument('--eps-steps', type=int, default=6000, metavar='ES',
                     help='number of episodes before epsilon equals eps-end (linearly degrades)')
+parser.add_argument('--demo-prop', type=float, default=0.3, metavar='DR',
+                    help='proportion of batch to set as transitions from the demo file')
 parser.add_argument('--no-train', action="store_true",
                     help='set to true if you don\'t want to actually train')
-parser.add_argument('--demo-file', metavar='DF',
+parser.add_argument('--demo-file', default=None, metavar='DF',
                     help='file to load pickled demonstrations')
+
+api_key = ''
+with open('api_key.json', 'r+') as api_file:
+    api_key = json.load(api_file)['api_key']
+
 
 if __name__ == '__main__':
     args = parser.parse_args()
-
     
     timestring = str(date.today()) + '_' + time.strftime("%Hh-%Mm-%Ss", time.localtime(time.time()))
     save_name = args.save_name + '_' + timestring
     run_name = save_name.split('/')[-1]
     configure("logs/" + run_name, flush_secs=5)
-
-    env = gym.make('ppaquette/' + args.env_name)
+    
+    env_spec = gym.spec('ppaquette/' + args.env_name)
+    env_spec.id = args.env_name
+    env = env_spec.make()
     env = ToDiscrete("minimal")(env)
     env = SkipWrapper(4)(env)
     env = PreprocessImage(env)
@@ -166,7 +183,8 @@ if __name__ == '__main__':
     env.reset()
     memory = ReplayMemory(10000)
 
-    demos = load_demos(args.demo_file)
+    if args.demo_file is not None:
+        demos = load_demos(args.demo_file)
 
     model = DQN(dtype, (1, 80, 80), env.action_space.n)
     if args.load_name is not None:
@@ -178,15 +196,18 @@ if __name__ == '__main__':
 
     policy = EpsGreedyPolicy(args.eps_start, args.eps_end, args.eps_steps)
 
-    # optimizer = optim.Adam(model.parameters(), lr=args.lr)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=L2_PENALTY)
 
     opt_step = 0
-    print('Pre-training')
-    for i in range(1000):
-        opt_step += 1
-        optimize_model(args.bsz, 1.0, opt_step)
-    print('Pre-training done')
+
+    if args.demo_file is not None:
+        print('Pre-training')
+        for i in range(10000):
+            opt_step += 1
+            optimize_model(args.bsz, 1.0, opt_step)
+        print('Pre-training done')
+    else:
+        args.demo_prop = 0
 
     ep_counter = count(1) if args.num_eps < 0 else range(args.num_eps)
     for i_episode in ep_counter:
@@ -206,7 +227,7 @@ if __name__ == '__main__':
             
             if len(memory) >= args.init_states and not args.no_train:
                 opt_step += 1
-                optimize_model(args.bsz, DEMO_RATIO, opt_step)
+                optimize_model(args.bsz, args.demo_prop, opt_step)
 
             total_reward += reward
             if done:
@@ -215,3 +236,6 @@ if __name__ == '__main__':
                 break
         if i_episode % 100 == 0 and not args.no_train:
             pickle.dump(model.state_dict(), open(save_name + '.p', 'wb'))
+    env.close()
+    if args.monitor:
+        gym.upload('monitor/' + run_name, api_key=api_key)

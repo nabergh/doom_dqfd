@@ -37,7 +37,7 @@ def _play_human_mode(self):
     state = self.game.get_state().image_buffer.copy()
     saver.new_episode(state)
     while not self.game.is_episode_finished():
-        self.game.advance_action(4)
+        self.game.advance_action(2)
         img = self.game.get_state().image_buffer
         if img is not None:
             state = img.copy()
@@ -52,13 +52,13 @@ def _play_human_mode(self):
 ppaquette_gym_doom.doom_env.DoomEnv._play_human_mode = _play_human_mode
 
 
-DOOM_ENV = 'DoomBasic-v0'
+DOOM_ENV = 'DoomDefendCenter-v0'
 
-for i in range(10):
+for i in range(4):
     env = gym.make('ppaquette/' + DOOM_ENV)
     env = ToDiscrete("minimal")(env)
     env.unwrapped._mode = 'human'
     env.reset()
 
 timestring = str(date.today()) + '_' + time.strftime("%Hh-%Mm-%Ss", time.localtime(time.time()))
-saver.save('demos/DoomBasic_demo_' + timestring + '.p')
+saver.save('demos/' + DOOM_ENV + '_demo_' + timestring + '.p')
