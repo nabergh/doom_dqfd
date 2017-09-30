@@ -7,10 +7,13 @@ import time
 import pickle
 import torch
 
+GAMMA = 0.99
+
 class TransitionSaver:
     def __init__(self):
         self.processor = PreprocessImage(None)
         self.memory = ReplayMemory()
+        self.transitions = []
 
     def new_episode(self, first_state):
         self.state = self.processor._observation(first_state)
@@ -18,7 +21,18 @@ class TransitionSaver:
     def add_transition(self, action, next_state, reward):
         if next_state is not None:
             next_state = self.processor._observation(next_state)
-        self.memory.push(Transition(self.state, self.add_noop(action), next_state, torch.FloatTensor([reward])))
+            self.transitions.insert(0, Transition(self.state, self.add_noop(action), next_state, torch.FloatTensor([reward]), torch.zeros(1)))
+
+            transitions = []
+            gamma = 1
+            for trans in self.transitions:
+                transitions.append(trans._replace(n_reward= trans.n_reward + gamma * reward))
+                gamma = gamma * GAMMA
+            self.transitions = transitions
+        else:
+            for trans in self.transitions:
+                self.memory.push(trans)
+            self.transitions = []
         self.state = next_state
     
     def add_noop(self, actions):
@@ -54,7 +68,7 @@ ppaquette_gym_doom.doom_env.DoomEnv._play_human_mode = _play_human_mode
 
 DOOM_ENV = 'DoomDefendCenter-v0'
 
-for i in range(4):
+for i in range(3):
     env = gym.make('ppaquette/' + DOOM_ENV)
     env = ToDiscrete("minimal")(env)
     env.unwrapped._mode = 'human'

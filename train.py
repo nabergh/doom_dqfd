@@ -24,7 +24,7 @@ from utils import ReplayMemory, PreprocessImage, EpsGreedyPolicy, Transition
 # Hyperparameters
 GAMMA = 0.99
 L2_PENALTY = 10e-5
-MARGIN = 10.0
+MARGIN = 1.0
 
 # GPU support
 USE_CUDA = torch.cuda.is_available()
@@ -90,10 +90,12 @@ def optimize_model(bsz, demo_prop, opt_step):
     state_batch = Variable(torch.cat(batch.state))
     action_batch = Variable(torch.cat(batch.action).unsqueeze(1))
     reward_batch = Variable(torch.cat(batch.reward))
+    n_reward_batch = Variable(torch.cat(batch.n_reward))
     if USE_CUDA:
         state_batch = state_batch.cuda()
         action_batch = action_batch.cuda()
         reward_batch = reward_batch.cuda()
+        n_reward_batch = n_reward_batch.cuda()
         non_final_mask = non_final_mask.cuda()
     q_vals = model(state_batch)
     state_action_values = q_vals.gather(1, action_batch)
@@ -104,14 +106,17 @@ def optimize_model(bsz, demo_prop, opt_step):
 
     q_loss = F.mse_loss(state_action_values, expected_state_action_values, size_average=False)
 
+
     if demo_prop > 0:
         num_actions = q_vals.size(1)
         margins = (torch.ones(num_actions, num_actions) - torch.eye(num_actions)) * MARGIN
         batch_margins = margins[action_batch.data.squeeze().cpu()]
         q_vals = q_vals + Variable(batch_margins).type(dtype)
-
         supervised_loss = (q_vals.max(1)[0].unsqueeze(1) - state_action_values).pow(2)[:demo_samples].sum()
-        loss = q_loss + supervised_loss
+
+        n_step_loss = F.mse_loss(state_action_values, n_reward_batch, size_average=False)
+
+        loss = q_loss + supervised_loss + n_step_loss
     else:
         loss = q_loss
 
@@ -124,6 +129,7 @@ def optimize_model(bsz, demo_prop, opt_step):
 
     if demo_prop > 0:
         log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
+        log_value('N Step Reward loss', n_step_loss.mean().data[0], opt_step)
 
 
 
@@ -202,7 +208,7 @@ if __name__ == '__main__':
 
     if args.demo_file is not None:
         print('Pre-training')
-        for i in range(10000):
+        for i in range(1000):
             opt_step += 1
             optimize_model(args.bsz, 1.0, opt_step)
         print('Pre-training done')
@@ -213,18 +219,36 @@ if __name__ == '__main__':
     for i_episode in ep_counter:
         state = env.reset()
         total_reward = 0
+        transitions = []
+        q_vals = model(Variable(state.type(dtype), volatile=True)).data
         for step_n in count():
-            q_vals = model(Variable(state.type(dtype), volatile=True)).data
             action = policy.select_action(q_vals, env)
             next_state, reward, done, _ = env.step(action[0])
             reward = torch.Tensor([reward])
 
-            if done:
-                next_state = None
+            transitions.insert(0, Transition(state, action, next_state, reward, torch.zeros(1)))
+            state = next_state        
+            gamma = 1
+            new_trans = []
+            for trans in transitions:
+                new_trans.append(trans._replace(n_reward= trans.n_reward + gamma * reward))
+                gamma = gamma * GAMMA
+            transitions = new_trans
 
-            memory.push(Transition(state, action, next_state, reward))
-            state = next_state
+            if not done:
+                q_vals = model(Variable(next_state.type(dtype), volatile=True)).data
+
+                if len(transitions) >= 10:
+                    last_trans = transitions.pop()
+                    last_trans = last_trans._replace(n_reward=last_trans.n_reward + gamma * q_vals.max(1)[0].cpu())
+                    memory.push(last_trans)
+
+                state = next_state
             
+            else:
+                for trans in transitions:
+                    memory.push(trans)
+
             if len(memory) >= args.init_states and not args.no_train:
                 opt_step += 1
                 optimize_model(args.bsz, args.demo_prop, opt_step)

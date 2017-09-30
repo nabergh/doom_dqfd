@@ -26,7 +26,7 @@ class PreprocessImage(ObservationWrapper):
         return screen
 
 
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'n_reward'))
 class ReplayMemory(object):
 
     # capacity == -1 means unlimited capacity
