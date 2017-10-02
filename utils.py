@@ -60,7 +60,7 @@ class EpsGreedyPolicy(object):
     def select_action(self, q_vals, env):
         sample = random.random()
         self.steps_done += 1
-        if sample < min(self.steps_done / self.eps_steps, 1) * (self.eps_start - self.eps_end):
+        if sample > min(self.steps_done / self.eps_steps, 1) * (self.eps_end - self.eps_start) + self.eps_start:
             return q_vals.max(1)[1].cpu()
         else:
             return torch.LongTensor([env.action_space.sample()])
