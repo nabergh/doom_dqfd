@@ -6,6 +6,9 @@ import torchvision.transforms as T
 from PIL import Image
 from gym.core import ObservationWrapper
 
+
+GAMMA = 0.99
+
 class PreprocessImage(ObservationWrapper):
     def __init__(self, env, width=80, height=80):
         if env is not None:
@@ -26,7 +29,31 @@ class PreprocessImage(ObservationWrapper):
         return screen
 
 
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'n_reward'))
+# Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'n_reward'))
+
+class Transition:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+def vectorize_batch(batch):
+    batch_dict = {}
+    for key in batch[0].__dict__:
+        batch_dict[key] = [item.__dict__[key] for item in batch]
+    vect_batch = Transition()
+    vect_batch.__dict__ = batch_dict
+    return vect_batch
+
+def calculate_nsteps(transitions, reward):
+    gamma = 1
+    new_trans = []
+    for trans in transitions:
+        trans.n_reward += gamma * reward
+        new_trans.append(trans)
+        # new_trans.append(trans._replace(n_reward= trans.n_reward + gamma * reward))
+        gamma = gamma * GAMMA
+    return new_trans
+
+
 class ReplayMemory(object):
 
     # capacity == -1 means unlimited capacity
