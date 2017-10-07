@@ -1,7 +1,7 @@
 import sys, gym
 import ppaquette_gym_doom
 from doom_utils import ToDiscrete
-from utils import ReplayMemory, PreprocessImage, Transition, calculate_nsteps
+from utils import ReplayMemory, PreprocessImage, Transition
 from datetime import date
 import time
 import pickle
@@ -22,12 +22,16 @@ class TransitionSaver:
     def add_transition(self, action, next_state, reward):
         if next_state is not None:
             next_state = self.processor._observation(next_state)
-            self.transitions.insert(0, Transition(state=self.state, action=self.add_noop(action),
-                next_state=next_state, reward=torch.FloatTensor([reward]), n_reward=torch.zeros(1)))
+            self.transitions.insert(0, Transition(self.state, self.add_noop(action), next_state, torch.FloatTensor([reward]), torch.zeros(1)))
 
-            self.transitions = calculate_nsteps(self.transitions, reward)
+            transitions = []
+            gamma = 1
+            for trans in self.transitions:
+                transitions.append(trans._replace(n_reward= trans.n_reward + gamma * reward))
+                gamma = gamma * GAMMA
+            self.transitions = transitions
         else:
-            for trans in reversed(self.transitions):
+            for trans in self.transitions:
                 self.memory.push(trans)
             self.transitions = []
         self.state = next_state
