@@ -5,6 +5,7 @@ import pickle
 import argparse
 import json
 import copy
+import random
 
 import gym
 import ppaquette_gym_doom
@@ -19,7 +20,7 @@ from torch.autograd import Variable
 
 from tensorboard_logger import configure, log_value
 
-from utils import ReplayMemory, PreprocessImage, EpsGreedyPolicy, Transition, calculate_nsteps, vectorize_batch
+from utils import ReplayMemory, ReplayMemoryRNN, PreprocessImage, EpsGreedyPolicy, Transition, calculate_nsteps, vectorize_batch
 from models import DQN, DQN_rnn
 
 # Hyperparameters
@@ -124,72 +125,102 @@ def optimize_dqfd(bsz, demo_prop, opt_step):
     log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
     log_value('N Step Reward loss', n_step_loss.mean().data[0], opt_step)
 
-def optimize_dqfd_rnn(bsz, demo_prop, opt_step):
-    if opt_step % 1000 == 0:
-        demos.memory = update_demo_hx(demos.memory)
+def optimize_dqfd_rnn(bsz, demos, opt_step):
+    if demos:
+        batch = vectorize_batch(demoiter.get_batch(bsz))
+    else:
+        batch = vectorize_batch([trans for trans in memory])
 
-    demo_samples = int(bsz * demo_prop)
-    demo_trans = []
-    if demo_samples > 0:
-        demo_trans = demos.sample(demo_samples)
-    agent_trans = memory.sample(bsz - demo_samples)
-    transitions = demo_trans + agent_trans
-    batch = vectorize_batch(transitions)
+    if batch.next_state[-1] is None:
+        end = len(batch.next_state) - 1
+    else:
+        end = len(batch.next_state)
 
-    non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
-    non_final_next_states_t = torch.cat(tuple(s for s in batch.next_state if s is not None)).type(dtype)
-    non_final_next_states = Variable(non_final_next_states_t, volatile=True)
     state_batch = Variable(torch.cat(batch.state))
+    non_final_next_states = Variable(torch.cat(batch.next_state).type(dtype)[:end], volatile=True)
     action_batch = Variable(torch.cat(batch.action).unsqueeze(1))
     reward_batch = Variable(torch.cat(batch.reward))
     n_reward_batch = Variable(torch.cat(batch.n_reward))
-    hx_batch = Variable(torch.cat(batch.hx))
+    hx_batch = torch.cat(batch.hx)
+
     if USE_CUDA:
         state_batch = state_batch.cuda()
         action_batch = action_batch.cuda()
         reward_batch = reward_batch.cuda()
         n_reward_batch = n_reward_batch.cuda()
         hx_batch = hx_batch.cuda()
-        non_final_mask = non_final_mask.cuda()
     q_vals, hx_batch_next = model(state_batch, hx_batch)
     state_action_values = q_vals.gather(1, action_batch)
 
-    next_state_values = Variable(torch.zeros(bsz).cuda())
-    next_qvals, _ = model(non_final_next_states, hx_batch_next)
-    next_state_values[non_final_mask] = next_qvals.data.max(1)[0]
+    next_state_values = Variable(torch.zeros(len(batch.next_state)).cuda())
+    next_qvals, _ = model(non_final_next_states, hx_batch_next[:end])
+    next_state_values[:end] = next_qvals.data.max(1)[0]
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
     q_loss = F.mse_loss(state_action_values, expected_state_action_values, size_average=False)
     n_step_loss = F.mse_loss(state_action_values, n_reward_batch, size_average=False)
 
-    num_actions = q_vals.size(1)
-    margins = (torch.ones(num_actions, num_actions) - torch.eye(num_actions)) * MARGIN
-    batch_margins = margins[action_batch.data.squeeze().cpu()]
-    q_vals = q_vals + Variable(batch_margins).type(dtype)
-    supervised_loss = (q_vals.max(1)[0].unsqueeze(1) - state_action_values).pow(2)[:demo_samples].sum()
+    if demos:
+        num_actions = q_vals.size(1)
+        margins = (torch.ones(num_actions, num_actions) - torch.eye(num_actions)) * MARGIN
+        batch_margins = margins[action_batch.data.squeeze().cpu()]
+        q_vals = q_vals + Variable(batch_margins).type(dtype)
+        supervised_loss = (q_vals.max(1)[0].unsqueeze(1) - state_action_values).pow(2).sum()
 
+        log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
+    else:
+        supervised_loss = 0
 
     loss = q_loss + LAM_SUP * supervised_loss + LAM_NSTEP * n_step_loss
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm(model.parameters(), 100)
     optimizer.step()
 
     log_value('Average loss', loss.mean().data[0], opt_step)
     log_value('Q loss', q_loss.mean().data[0], opt_step)
-    log_value('Supervised loss', supervised_loss.mean().data[0], opt_step)
     log_value('N Step Reward loss', n_step_loss.mean().data[0], opt_step)
 
 
-def update_demo_hx(transitions):
-    hx = Variable(torch.zeros(1, model.rnn_size).type(dtype), volatile=True)
-    for i in range(len(transitions)):
-        transitions[i].hx = hx.data
-        _, hx = model(Variable(transitions[i].state.type(dtype), volatile=True), hx)
-        if transitions[i].next_state is None:
-            hx = Variable(torch.zeros(1, model.rnn_size).type(dtype), volatile=True)
-    return transitions
+# def update_demo_hx(transitions):
+#     hx = Variable(torch.zeros(1, model.rnn_size).type(dtype), volatile=True)
+#     for i in range(len(transitions)):
+#         transitions[i].hx = hx.data
+#         _, hx = model(Variable(transitions[i].state.type(dtype), volatile=True), hx)
+#         if transitions[i].next_state is None:
+#             hx = Variable(torch.zeros(1, model.rnn_size).type(dtype), volatile=True)
+#     return transitions
 
+class DemoIterator(object):
+    def __init__(self, demos):
+        self.demos = demos
+        self.pos = 0
+
+    def get_batch(self, bsz):
+        batch = []
+        while len(batch) < bsz:
+            self.demos[self.pos].hx = self.get_hx(len(batch) == 0)
+            batch.append(self.demos[self.pos])
+            self.pos += 1
+            self.pos = self.pos % len(self.demos)
+            if self.check_beginning_ep():
+                break
+        return batch
+
+    def check_beginning_ep(self):
+        return self.pos == 0 or self.demos[self.pos - 1].next_state is None
+
+    def get_hx(self, first):
+        if self.check_beginning_ep():
+            return Variable(torch.zeros(1, model.rnn_size).type(dtype))
+        else:
+            if first:
+                prev_hx = Variable(self.demos[self.pos - 1].hx.data)
+            else:
+                prev_hx = self.demos[self.pos - 1].hx
+            _, hx = model(Variable(self.demos[self.pos - 1].state.type(dtype)), prev_hx)
+            return hx
 
 
 parser = argparse.ArgumentParser(description='Doom DQN')
@@ -249,16 +280,17 @@ if __name__ == '__main__':
     env = SkipWrapper(4)(env)
     env = PreprocessImage(env)
     env.reset()
-    memory = ReplayMemory(1000)
+
+    memory = ReplayMemoryRNN(args.bsz)
 
     model = DQN_rnn(dtype, (1, 80, 80), env.action_space.n)
-    # model = DQN(dtype, (1, 80, 80), env.action_space.n)
     if args.load_name is not None:
         model.load_state_dict(pickle.load(open(args.load_name, 'rb')))
 
     if args.demo_file is not None:
         demos = load_demos(args.demo_file)
-        demos.memory = update_demo_hx(demos.memory)
+        demoiter = DemoIterator(demos)
+        # demos.memory = update_demo_hx(demos.memory)
 
     if args.no_train:
         args.eps_start = 0.0
@@ -271,22 +303,22 @@ if __name__ == '__main__':
 
     opt_step = 0
 
-    if args.demo_file is not None and not args.no_train:
-        print('Pre-training')
-        for i in range(1000):
-            opt_step += 1
-            optimize_dqfd_rnn(args.bsz, 1.0, opt_step)
-        print('Pre-training done')
-    else:
-        args.demo_prop = 0
+    # if args.demo_file is not None and not args.no_train:
+    #     print('Pre-training')
+    #     for i in range(1000):
+    #         opt_step += 1
+    #         optimize_dqfd_rnn(args.bsz, 1.0, opt_step)
+    #     print('Pre-training done')
+    # else:
+    #     args.demo_prop = 0
 
     ep_counter = count(1) if args.num_eps < 0 else range(args.num_eps)
     for i_episode in ep_counter:
         state = env.reset()
         total_reward = 0
         transitions = []
-        hidden_state = Variable(torch.zeros(1, model.rnn_size).type(dtype), volatile=True)
-        q_vals, next_hidden = model(Variable(state.type(dtype), volatile=True), hidden_state)
+        hidden_state = Variable(torch.zeros(1, model.rnn_size).type(dtype))
+        q_vals, next_hidden = model(Variable(state.type(dtype), requires_grad=False), hidden_state)
         q_vals = q_vals.data
         for step_n in count():
             action = policy.select_action(q_vals, env)
@@ -294,18 +326,18 @@ if __name__ == '__main__':
             reward = torch.Tensor([reward])
 
             transitions.insert(0, Transition(state=state, action=action, 
-                next_state=next_state, reward=reward, n_reward=torch.zeros(1), hx=hidden_state.data))
+                next_state=next_state, reward=reward, n_reward=torch.zeros(1), hx=hidden_state))
             transitions = calculate_nsteps(transitions, reward)
 
             if not done:
                 hidden_state = next_hidden
-                q_vals, next_hidden = model(Variable(next_state.type(dtype), volatile=True), hidden_state)
+                q_vals, next_hidden = model(Variable(state.type(dtype), requires_grad=False), hidden_state)
                 q_vals = q_vals.data
 
-                if len(transitions) >= 10:
-                    last_trans = transitions.pop()
-                    last_trans.n_reward += GAMMA ** 10 * q_vals.max(1)[0].cpu()
-                    memory.push(last_trans)
+                if len(transitions) >= args.bsz:
+                    transitions = calculate_nsteps(transitions, GAMMA * q_vals.max(1)[0].cpu())
+                    while(len(transitions) > 0):
+                        memory.push(transitions.pop())
 
                 state = next_state
             
@@ -313,14 +345,26 @@ if __name__ == '__main__':
                 for trans in transitions:
                     memory.push(trans)
 
-            if len(memory) >= args.init_states and not args.no_train:
+            # if len(memory) >= args.init_states and not args.no_train:
+            if len(memory) >= args.bsz and not args.no_train:
                 opt_step += 1
-                optimize_dqfd_rnn(args.bsz, args.demo_prop, opt_step)
+                optimize_dqfd_rnn(args.bsz, False, opt_step)
+                hidden_state = Variable(hidden_state.data.type(dtype))
+                _, next_hidden = model(Variable(state.type(dtype), requires_grad=False), hidden_state)
+
+                if opt_step % 2 == 0:
+                    optimize_dqfd_rnn(args.bsz, True, opt_step)
+
 
             total_reward += reward
             if done:
                 print('Finished episode ' + str(i_episode) + ' with reward ' + str(total_reward[0]) + ' after ' + str(step_n) + ' steps')
                 log_value('Total Reward', total_reward[0], i_episode)
+
+                if len(memory) > 0 and not args.no_train:
+                    opt_step += 1
+                    optimize_dqfd_rnn(args.bsz, args.demo_prop, opt_step)
+
                 break
 
         if i_episode % 100 == 0 and not args.no_train:

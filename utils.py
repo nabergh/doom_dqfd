@@ -1,5 +1,6 @@
 import random
 from collections import namedtuple
+import queue
 
 import torch
 import torchvision.transforms as T
@@ -49,7 +50,6 @@ def calculate_nsteps(transitions, reward):
     for trans in transitions:
         trans.n_reward += gamma * reward
         new_trans.append(trans)
-        # new_trans.append(trans._replace(n_reward= trans.n_reward + gamma * reward))
         gamma = gamma * GAMMA
     return new_trans
 
@@ -73,8 +73,36 @@ class ReplayMemory(object):
     def sample(self, batch_size):
         return random.sample(self.memory, batch_size)
 
+    def get_contiguous(self, batch_size):
+        ind = int(random.random() * (len(self.memory) - batch_size))
+        return self.memory[ind: ind + batch_size]
+
+    def __getitem__(self, key):
+        return self.memory[key]
+
     def __len__(self):
         return len(self.memory)
+
+class ReplayMemoryRNN(object):
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = queue.Queue()
+
+    def push(self, trans):
+        if self.memory.qsize() >= self.capacity:
+            self.memory.get()
+        self.memory.put(trans)
+
+    # empties memory by iterating
+    def __iter__(self):
+        while self.memory.qsize() > 0:
+            yield self.memory.get()
+
+    def __getitem__(self, key):
+        return self.memory[key]
+
+    def __len__(self):
+        return self.memory.qsize()
 
 class EpsGreedyPolicy(object):
     def __init__(self, eps_start, eps_end, eps_steps):
