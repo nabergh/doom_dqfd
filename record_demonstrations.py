@@ -6,6 +6,7 @@ from datetime import date
 import time
 import pickle
 import torch
+import argparse
 
 GAMMA = 0.99
 FRAMESKIP = 4
@@ -47,7 +48,6 @@ class TransitionSaver:
             pickle.dump(self.memory, memory_file)
 
 
-saver = TransitionSaver()
 def _play_human_mode(self):
     state = self.game.get_state().image_buffer.copy()
     saver.new_episode(state)
@@ -63,17 +63,24 @@ def _play_human_mode(self):
         saver.add_transition(action, state, reward)
         time.sleep(0.02857)  # 35 fps = 0.02857 sleep between frames
     return
-
 ppaquette_gym_doom.doom_env.DoomEnv._play_human_mode = _play_human_mode
 
 
-DOOM_ENV = 'DoomMyWayHome-v0'
+parser = argparse.ArgumentParser(description='Doom Demo Recorder')
+parser.add_argument('--env-name', default='DoomBasic-v0', metavar='ENV',
+                    help='environment to train on (default: DoomBasic-v0)')
+parser.add_argument('--num-eps', type=int, default='5', metavar='NE',
+                    help='number of demo episodes to record')
 
-for i in range(10):
-    env = gym.make('ppaquette/' + DOOM_ENV)
-    env = ToDiscrete("minimal")(env)
-    env.unwrapped._mode = 'human'
-    env.reset()
+if __name__ == '__main__':
+    args = parser.parse_args()
+    saver = TransitionSaver()
 
-timestring = str(date.today()) + '_' + time.strftime("%Hh-%Mm-%Ss", time.localtime(time.time()))
-saver.save('demos/' + DOOM_ENV + '_demo_' + 'fs_'  + str(FRAMESKIP) + '_' + timestring + '.p')
+    for i in range(args.num_eps):
+        env = gym.make('ppaquette/' + args.env_name)
+        env = ToDiscrete("minimal")(env)
+        env.unwrapped._mode = 'human'
+        env.reset()
+
+    timestring = str(date.today()) + '_' + time.strftime("%Hh-%Mm-%Ss", time.localtime(time.time()))
+    saver.save('demos/' + args.env_name + '_demo_' + 'fs_'  + str(FRAMESKIP) + '_' + timestring + '.p')

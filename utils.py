@@ -6,6 +6,8 @@ import torchvision.transforms as T
 from PIL import Image
 from gym.core import ObservationWrapper
 
+
+# environment wrapper to process the input frames and turn them into pytorch tensors
 class PreprocessImage(ObservationWrapper):
     def __init__(self, env, width=80, height=80):
         if env is not None:
@@ -13,20 +15,21 @@ class PreprocessImage(ObservationWrapper):
         self.resize = T.Compose([T.ToPILImage(),
                     T.Scale((width,height), interpolation=Image.CUBIC),
                     T.ToTensor()])
-        self.normalize = T.Normalize((0, 0, 0), (1, 1, 1))
 
-# image transformations, to a 1x3x80x80 tensor
+# image transformations, to a 1x1x80x80 tensor
     def _observation(self, screen):
         screen = torch.from_numpy(screen)
         screen = screen.permute(2, 1, 0)
         screen = self.resize(screen)
         screen = screen.mean(0, keepdim=True)
-        # screen = self.normalize(screen)
         screen = screen.unsqueeze(0)
         return screen
 
 
+
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'n_reward'))
+
+# object to hold all the transformations from which batches are sampled
 class ReplayMemory(object):
 
     # capacity == -1 means unlimited capacity
@@ -57,6 +60,7 @@ class EpsGreedyPolicy(object):
         eps_steps = max(eps_steps, 1)
         self.steps_done = 0
 
+    # epsilon changes linearly from eps_start to eps_end within the first eps_steps number of steps
     def select_action(self, q_vals, env):
         sample = random.random()
         self.steps_done += 1
@@ -64,4 +68,3 @@ class EpsGreedyPolicy(object):
             return q_vals.max(1)[1].cpu()
         else:
             return torch.LongTensor([env.action_space.sample()])
-
