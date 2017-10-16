@@ -10,3 +10,5 @@ Dependencies:
 - [tensorboard logger](https://github.com/TeamHG-Memex/tensorboard_logger)
 
 The tensorboard dependencies can be removed by commenting out their corresponding lines of code in `train.py`
+
+The blog post I wrote about the code in this repo can be found [at this link](https://medium.com/@nicholasabergh/learning-to-play-doom-from-demonstrations-5fa6d6fb16b0).
